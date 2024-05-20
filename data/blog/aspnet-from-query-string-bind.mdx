@@ -1,0 +1,163 @@
+---
+title: Solving [FromQuery] convert empty string to null issue
+date: '2024-05-20'
+tags: ['asp.net']
+draft: false
+layout: PostSimple
+summary: When using [FromQuery] string, it will convert empty string parameter to null which may influence search function.
+---
+
+While working with ASP.NET Core, you may encounter a problem where a [FromQuery] parameter is converted to null when it is passed as an empty string. This may not be a problem most of the time, but if you want to implement functionalities like searching for names that contain spaces, it can become a problem. In this blog post, we'll discuss how to solve this problem using a custom ModelBinder.
+
+To demonstrate this issue, we created an ASP.NET Core Web API project and a controller with 4 actions.
+
+```csharp
+[ApiController]
+[Route("[controller]")]
+public class ModelBinderController : ControllerBase
+{
+    [HttpGet("simple")]
+    public IActionResult GetSimpleType([FromQuery] string value)
+    {
+        return Ok($"GetSimpleType: Value is [{value}]");
+    }
+    [HttpGet("complex")]
+    public IActionResult GetComplexType([FromQuery] Model model)
+    {
+        return Ok($"GetComplexType: Value is [{model.Value}]");
+    }
+    [HttpPost("simple")]
+    public IActionResult PostSimpleType([FromBody] string value)
+    {
+        return Ok($"PostSimpleType: Value is [{value}]");
+    }
+    [HttpPost("complex")]
+    public IActionResult PostComplexType([FromBody] Model model)
+    {
+        return Ok($"PostComplexType: Value is [{model.Value}]");
+    }
+}
+
+public class Model
+{
+    public string Value { get; set; }
+}
+```
+
+We will test both simple string or complex type that has a string value, also in get and post methods. Below is the result.
+
+```bash
+POST https://localhost:7132/modelbinder/simple
+body: "value"
+returns: PostSimpleType: Value is [m22odel]
+body: "   "
+returns: PostSimpleType: Value is [   ]
+
+POST https://localhost:7132/modelbinder/complex
+body { "value"; "   " }
+returns: PostComplexType: Value is [  ]
+body { "value": "value" }
+returns: PostComplexType: Value is [value]
+
+GET https://localhost:7132/modelbinder/simple?value=value
+returns: GetSimpleType: Value is [value]
+GET https://localhost:7132/modelbinder/simple?value=%20%20%20
+returns: GetSimpleType: Value is [] # wrong
+
+GET https://localhost:7132/modelbinder/complex?value=value
+returns: GetComplexType: Value is [value]
+GET https://localhost:7132/modelbinder/complex?value=%20%20%20
+returns: GetComplexType: Value is [] # wrong
+```
+
+It looks like all post requests run correctly. But for get requests, the empty string %20%20%20 is converted to null.
+
+The reason for this is in SimpleTypeModelBinder, where there is a property called ConvertEmptyStringToNull, and the default value is true. Therefore, white spaces are converted to null. To resolve this, we just need to set it to false.
+
+```csharpif (bindingContext.ModelType == typeof(string))
+{
+    // Already have a string. No further conversion required but handle ConvertEmptyStringToNull.
+    if (bindingContext.ModelMetadata.ConvertEmptyStringToNull && string.IsNullOrWhiteSpace(value))
+    {
+        model = null;
+    }
+    else
+    {
+        model = value;
+    }
+}
+```
+
+First, we need to create a custom ModelBinder class that inherits from the `IModelBinder` interface. In this class, we'll implement the `BindModelAsync` method. This method will be called by the framework to bind the model.
+
+```csharp
+public class EnhancedSimpleTypeModelBinder : IModelBinder
+{
+    private SimpleTypeModelBinder baseBinder;
+    public EnhancedSimpleTypeModelBinder(Type type, ILoggerFactory loggerFactory)
+    {
+        this.baseBinder = new SimpleTypeModelBinder(type, loggerFactory);
+    }
+
+    public Task BindModelAsync(ModelBindingContext bindingContext)
+    {
+        (bindingContext.ModelMetadata as DefaultModelMetadata).DisplayMetadata.ConvertEmptyStringToNull = false;
+        return baseBinder.BindModelAsync(bindingContext);
+    }
+}
+```
+
+Then, we need to create the ModelBinderProvider class. This class will create instances of our custom ModelBinder.
+
+```csharp
+public class EnhancedSimpleTypeModelBinderProvider : IModelBinderProvider
+{
+    public IModelBinder GetBinder(ModelBinderProviderContext context)
+    {
+        if (!context.Metadata.IsComplexType)
+        {
+            var loggerFactory = context.Services.GetRequiredService<ILoggerfactory>();
+            return new EnhancedSimpleTypeModelBinder(context.Metadata.ModelType, loggerFactory);
+        }
+        return null;
+    }
+}
+```
+
+Finally, we need to register our custom ModelBinder in the application. We can do this by adding the following code to the Program.cs:
+
+```csharp
+builder.Services.AddControllers(options =>
+{
+    var originProvider = options.ModelBinderProviders.First(p => p.GetType() == typeof(SimpleTypeModelBinderProvider));
+    options.ModelBinderProviders[options.ModelBinderProviders.IndexOf(originProvider)] = new EnhancedSimpleTypeModelBinderProvider();
+});
+```
+
+Now let’s test again.
+
+```bash
+POST https://localhost:7132/modelbinder/simple
+body: "value"
+returns: PostSimpleType: Value is [m22odel]
+body: "   "
+returns: PostSimpleType: Value is [   ]
+
+POST https://localhost:7132/modelbinder/complex
+body { "value"; "   " }
+returns: PostComplexType: Value is [  ]
+body { "value": "value" }
+returns: PostComplexType: Value is [value]
+
+GET https://localhost:7132/modelbinder/simple?value=value
+returns: GetSimpleType: Value is [value]
+GET https://localhost:7132/modelbinder/simple?value=%20%20%20
+returns: GetSimpleType: Value is [   ] # correct
+
+GET https://localhost:7132/modelbinder/complex?value=value
+returns: GetComplexType: Value is [value]
+GET https://localhost:7132/modelbinder/complex?value=%20%20%20
+returns: GetComplexType: Value is [   ] # correct
+```
+
+Everything works fine!
